@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nicolaka-netshoot-ds-1
+  namespace: default
+  labels:
+    k8s-app: nicolaka-netshoot-ds-1
+spec:
+  selector:
+    matchLabels:
+      name: nicolaka-netshoot-ds-1
+  template:
+    metadata:
+      labels:
+        name: nicolaka-netshoot-ds-1
+    spec:
+      nodeSelector:
+         type: stack-1
+      containers:
+      - name: nicolaka-netshoot-ds-1
+        image: nicolaka/netshoot
+        resources:
+          limits:
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        command: ["/bin/sh"]
+        args: ["-c", "while true; do echo hello; sleep 10;done"]

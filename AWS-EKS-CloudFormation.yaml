@@ -1,0 +1,258 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Minimal reproducible example of bug in EKS'
+Metadata:
+  Author:
+    Description: Hao Peng <github@pengs.us>
+  License:
+    Description: 'This is the minimal reproducible example of bug in EKS'
+
+Parameters:
+# Cluster Information
+  ClusterName:
+    Description: The cluster name provided when the cluster was created. If it is incorrect, nodes will not be able to join the cluster.
+    Type: String
+    Default: EKS_CLUSTER_NAME
+
+  KeyName:
+    Description: The EC2 Key Pair to allow SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+
+
+  ClusterControlPlaneSecurityGroup:
+    Description: The security group of the cluster control plane. Usually it's the default one
+    Type: AWS::EC2::SecurityGroup::Id
+
+  VpcId:
+    Description: The VPC of the worker instances
+    Type: AWS::EC2::VPC::Id
+
+  Subnets:
+    Description: The subnets where workers can be created.
+    Type: List<AWS::EC2::Subnet::Id>
+
+# Only run gitlab-runner coordinator
+  NodeImageId:
+    Type: AWS::EC2::Image::Id
+    Description: Node base image of Gitlab runner node. Find the latest AMI id here - https://docs.aws.amazon.com/eks/latest/userguide/eks-optimized-ami.html
+    Default: ami-07be7092831897fd6
+
+
+  InstanceType:
+    Description: EC2 instance type for the Gitlab Runner node instances.
+    Type: String
+    Default: t3a.medium
+    AllowedValues:
+    - t3a.small
+    - t3a.medium
+    - t3a.large
+    ConstraintDescription: Must be a valid EC2 instance type
+
+
+# Group Names
+
+  NodeGroupName:
+    Description: Unique identifier for the OnDemand Node Group.
+    Type: String
+    Default: 'NodeGroup'
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "EKS Cluster Information"
+        Parameters:
+          - ClusterName
+          - ClusterControlPlaneSecurityGroup
+          - VpcId
+          - Subnets
+          - KeyName
+      -
+        Label:
+          default: "Gitlab Runner Worker Node Configuration"
+        Parameters:
+          - NodeGroupName
+          - InstanceType
+
+Resources:
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${AWS::StackName}-NodeInstanceProfile"
+      Path: "/"
+      Roles:
+      - !Ref NodeInstanceRole
+
+  NodeInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-Role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Policies:
+      - PolicyName: !Sub "${AWS::StackName}-ClusterAutoscaler"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: K8NodeASGPerms
+            Effect: Allow
+            Action:
+            - autoscaling:DescribeAutoScalingGroups
+            - autoscaling:DescribeAutoScalingInstances
+            - autoscaling:DescribeLaunchConfigurations
+            - autoscaling:SetDesiredCapacity
+            - autoscaling:DescribeTags
+            - autoscaling:TerminateInstanceInAutoScalingGroup
+            - autoscaling:DescribeTags
+            Resource: "*"
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::StackName}-NodeSecurityGroup"
+      GroupDescription: Security group for all nodes in the cluster
+      VpcId:
+        !Ref VpcId
+      Tags:
+      - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+        Value: 'owned'
+
+  NodeSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow node to communicate with each other
+      GroupId: !Ref NodeSecurityGroup
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      IpProtocol: '-1'
+      FromPort: 0
+      ToPort: 65535
+
+  NodeSecurityGroupFromControlPlaneIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow worker Kubelets and pods to receive communication from the cluster control plane
+      GroupId: !Ref NodeSecurityGroup
+      SourceSecurityGroupId: !Ref ClusterControlPlaneSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+
+  ControlPlaneEgressToNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow the cluster control plane to communicate with worker Kubelet and pods
+      GroupId: !Ref ClusterControlPlaneSecurityGroup
+      DestinationSecurityGroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+
+  ControlPlaneEgressToNodeSecurityGroupOn443:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow the cluster control plane to communicate with pods running extension API servers on port 443
+      GroupId: !Ref ClusterControlPlaneSecurityGroup
+      DestinationSecurityGroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+
+  ClusterControlPlaneSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: NodeSecurityGroup
+    Properties:
+      Description: Allow pods to communicate with the cluster API Server
+      GroupId: !Ref ClusterControlPlaneSecurityGroup
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      ToPort: 443
+      FromPort: 443
+
+
+
+  NodeGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-asg"
+      DesiredCapacity: 1
+      LaunchConfigurationName: !Ref NodeLaunchConfig
+      MinSize: 1
+      MaxSize: 1
+      VPCZoneIdentifier:
+        !Ref Subnets
+      Tags:
+      - Key: Name
+        Value: !Sub "${AWS::StackName}-${NodeGroupName}-Node"
+        PropagateAtLaunch: 'true'
+      - Key: StackName
+        Value: !Sub "${AWS::StackName}"
+        PropagateAtLaunch: 'true'
+      - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+        Value: 'owned'
+        PropagateAtLaunch: 'true'
+      - Key: Spot
+        Value: 'false'
+        PropagateAtLaunch: 'true'
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: '1'
+        MaxBatchSize: '1'
+
+
+
+  NodeLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      LaunchConfigurationName: !Sub "${AWS::StackName}-NodeLaunchConfig"
+      AssociatePublicIpAddress: 'true'
+      IamInstanceProfile: !Ref NodeInstanceProfile
+      ImageId: !Ref NodeImageId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SecurityGroups:
+      - !Ref NodeSecurityGroup
+      - sg-069122e6c373f574e
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 64
+            VolumeType: gp2
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            set -o xtrace
+            /etc/eks/bootstrap.sh ${ClusterName} \
+              --kubelet-extra-args --node-labels=lifecycle=OnDemand,type=${AWS::StackName}
+            /opt/aws/bin/cfn-signal --exit-code $? \
+                     --stack ${AWS::StackName} \
+                     --resource NodeGroup  \
+                     --region ${AWS::Region}
+
+
+Outputs:
+  NodeInstanceRole:
+    Description: The node instance role. Needed for aws-cm-auth.yaml
+    Value: !GetAtt NodeInstanceRole.Arn
+  MyStacksRegion:
+    Value: !Ref "AWS::Region"
+    Description: The region where the stack is created
